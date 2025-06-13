@@ -15,27 +15,27 @@ YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 NOTIFICATION_WEBHOOK = os.environ.get('NOTIFICATION_WEBHOOK')  # Slack/Discord
 
-# YouTuber Konfiguration mit echten Channel IDs
+# YouTuber Konfiguration mit VERIFIZIERTEN Channel IDs
 YOUTUBERS = {
-    'cryptoheroes': {
-        'channel_id': 'UCN9Tn5k8KrW8rMwb-3HDGkg',  # CryptoHeroesYT
-        'name': 'CryptoHeroesYT'
+    'coinbureau': {
+        'channel_id': 'UCqK_GSMbpiV8spgD3ZGloSw',  # Coin Bureau (Guy) - 5M+ Subs
+        'name': 'Coin Bureau'
     },
-    'kryptowolf': {
-        'channel_id': 'UC2D2CMWXMOVWx7giW1n3LIw',  # KryptoWolfDE
-        'name': 'KryptoWolfDE'
+    'larkdavis': {
+        'channel_id': 'UCl2oCaw8hdR_kbqyqd2klIA',  # Lark Davis - 584K Subs
+        'name': 'Lark Davis'  
     },
-    'finanzwissen': {
-        'channel_id': 'UC0dVE6xBGzENCi6U0DkpGQw',  # Finanzwissen
-        'name': 'Finanzwissen'
+    'cryptoru': {
+        'channel_id': 'UCwYEKgdmhJoRmhL_gm1mDow',  # CryptosRUs - 760K Subs
+        'name': 'CryptosRUs'
     },
-    'robynhd': {
-        'channel_id': 'UC8T2-PPSdCR8oW_2rh5-F8Q',  # RobynHD
-        'name': 'RobynHD'
+    'datadash': {
+        'channel_id': 'UCCatR7nWbYrkVXdxXb4cGXw',  # DataDash - 513K Subs
+        'name': 'DataDash'
     },
-    'coincheck': {
-        'channel_id': 'UCs7_R6w6S6t-qNf_bAaUO5w',  # CoinCheckTV
-        'name': 'CoinCheckTV'
+    'cryptozombie': {
+        'channel_id': 'UCiUnrCUGCJTCC7KjuW493Ww',  # Crypto Zombie - 300K+ Subs
+        'name': 'Crypto Zombie'
     }
 }
 
@@ -331,15 +331,15 @@ def debug_test_youtube_simple():
         if not YOUTUBE_API_KEY:
             return jsonify({'error': 'No YouTube API key'}), 500
             
-        # Einfachster YouTube API Call
+        # Einfachster YouTube API Call - teste Coin Bureau
         url = 'https://www.googleapis.com/youtube/v3/channels'
         params = {
             'key': YOUTUBE_API_KEY,
-            'id': 'UCN9Tn5k8KrW8rMwb-3HDGkg',  # CryptoHeroesYT
+            'id': 'UCqK_GSMbpiV8spgD3ZGloSw',  # Coin Bureau
             'part': 'snippet'
         }
         
-        print("Testing YouTube API...")
+        print("Testing YouTube API with Coin Bureau...")
         response = requests.get(url, params=params, timeout=10)
         
         if response.status_code == 200:
