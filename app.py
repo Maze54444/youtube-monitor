@@ -77,27 +77,31 @@ Erstelle eine Executive Summary aller heute verarbeiteten Krypto/Finanz-YouTube-
 
 def init_db():
     """Datenbank initialisieren"""
-    with sqlite3.connect('youtube_monitor.db') as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY,
-                video_id TEXT UNIQUE,
-                channel_name TEXT,
-                title TEXT,
-                published_at TEXT,
-                processed_at TEXT,
-                transcript TEXT,
-                summary TEXT
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS daily_summaries (
-                id INTEGER PRIMARY KEY,
-                date TEXT UNIQUE,
-                summary TEXT,
-                created_at TEXT
-            )
-        ''')
+    try:
+        with sqlite3.connect('youtube_monitor.db') as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS videos (
+                    id INTEGER PRIMARY KEY,
+                    video_id TEXT UNIQUE,
+                    channel_name TEXT,
+                    title TEXT,
+                    published_at TEXT,
+                    processed_at TEXT,
+                    transcript TEXT,
+                    summary TEXT
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS daily_summaries (
+                    id INTEGER PRIMARY KEY,
+                    date TEXT UNIQUE,
+                    summary TEXT,
+                    created_at TEXT
+                )
+            ''')
+        print("Database initialized successfully")
+    except Exception as e:
+        print(f"Database initialization error: {e}")
 
 def get_channel_videos(channel_id, hours_back=2):
     """Neue Videos eines Kanals abrufen"""
@@ -116,10 +120,14 @@ def get_channel_videos(channel_id, hours_back=2):
             'type': 'video'
         }
         
-        response = requests.get(url, params=params)
+        print(f"Fetching videos for channel {channel_id} since {published_after}")
+        response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
         
-        return response.json().get('items', [])
+        data = response.json()
+        print(f"Found {len(data.get('items', []))} videos")
+        return data.get('items', [])
+        
     except Exception as e:
         print(f"Error fetching videos for channel {channel_id}: {e}")
         return []
@@ -127,6 +135,7 @@ def get_channel_videos(channel_id, hours_back=2):
 def get_transcript(video_id):
     """Transkript eines Videos abrufen"""
     try:
+        print(f"Getting transcript for video {video_id}")
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         
         # Bevorzuge deutsche Transkription
@@ -141,20 +150,23 @@ def get_transcript(video_id):
         transcript_data = transcript.fetch()
         full_text = ' '.join([entry['text'] for entry in transcript_data])
         
+        print(f"Transcript fetched successfully, length: {len(full_text)} chars")
         return {
             'success': True,
             'transcript': full_text,
             'language': transcript.language_code
         }
     except Exception as e:
+        print(f"Transcript error for {video_id}: {e}")
         return {
             'success': False,
             'error': str(e)
         }
 
 def call_gemini_api(prompt, model="gemini-1.5-flash"):
-    """Gemini API für Zusammenfassungen - 40x günstiger als Claude"""
+    """Gemini API für Zusammenfassungen"""
     try:
+        print(f"Calling Gemini API with prompt length: {len(prompt)}")
         headers = {
             'Content-Type': 'application/json'
         }
@@ -173,11 +185,13 @@ def call_gemini_api(prompt, model="gemini-1.5-flash"):
             }
         }
         
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(url, headers=headers, json=data, timeout=60)
         response.raise_for_status()
         
         result = response.json()
-        return result['candidates'][0]['content']['parts'][0]['text']
+        summary = result['candidates'][0]['content']['parts'][0]['text']
+        print(f"Gemini API response received, length: {len(summary)}")
+        return summary
         
     except Exception as e:
         print(f"Gemini API Error: {e}")
@@ -191,6 +205,8 @@ def smart_chunk_processing(transcript):
     if len(transcript) <= max_chunk_size:
         # Klein genug für eine Verarbeitung
         return call_gemini_api(INDIVIDUAL_VIDEO_PROMPT.format(transcript=transcript))
+    
+    print(f"Large transcript ({len(transcript)} chars), chunking...")
     
     # Große Transkripte aufteilen
     sentences = transcript.split('. ')
@@ -210,6 +226,8 @@ def smart_chunk_processing(transcript):
     if current_chunk:
         chunks.append(current_chunk)
     
+    print(f"Split into {len(chunks)} chunks")
+    
     # Jeder Chunk einzeln verarbeiten
     chunk_summaries = []
     for i, chunk in enumerate(chunks):
@@ -228,7 +246,7 @@ Fokus auf:
     
     # Finale Zusammenfassung
     final_prompt = INDIVIDUAL_VIDEO_PROMPT.format(
-        transcript=chr(10).join([f"Teil {i+1}: {summary}" for i, summary in enumerate(chunk_summaries)])
+        transcript='\n'.join([f"Teil {i+1}: {summary}" for i, summary in enumerate(chunk_summaries)])
     )
     
     return call_gemini_api(final_prompt)
@@ -251,22 +269,102 @@ def save_video_to_db(video_data):
                     video_data['transcript'],
                     video_data['summary']
                 ))
+                print(f"Video saved to database: {video_data['title']}")
         except Exception as e:
             print(f"Database error: {e}")
 
 def send_notification(title, message):
     """Benachrichtigung senden"""
     if not NOTIFICATION_WEBHOOK:
+        print("No notification webhook configured")
         return
     
     try:
         payload = {
             'text': f"**{title}**\n{message}"
         }
-        requests.post(NOTIFICATION_WEBHOOK, json=payload)
+        requests.post(NOTIFICATION_WEBHOOK, json=payload, timeout=10)
+        print("Notification sent successfully")
     except Exception as e:
         print(f"Notification error: {e}")
 
+# DEBUG ENDPOINTS
+@app.route('/debug/test_simple')
+def debug_test_simple():
+    """Einfacher Test ohne externe APIs"""
+    try:
+        return jsonify({
+            'status': 'ok',
+            'message': 'Simple test works',
+            'youtubers_count': len(YOUTUBERS),
+            'sample_channel': list(YOUTUBERS.keys())[0],
+            'api_keys': {
+                'youtube': bool(YOUTUBE_API_KEY),
+                'gemini': bool(GEMINI_API_KEY)
+            }
+        })
+    except Exception as e:
+        print(f"DEBUG ERROR: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/debug/test_db')
+def debug_test_db():
+    """Database-Test"""
+    try:
+        with sqlite3.connect('youtube_monitor.db') as conn:
+            cursor = conn.execute('SELECT COUNT(*) FROM videos')
+            video_count = cursor.fetchone()[0]
+        
+        return jsonify({
+            'status': 'ok',
+            'database': 'connected',
+            'videos_count': video_count
+        })
+    except Exception as e:
+        print(f"DATABASE ERROR: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/debug/test_youtube_simple')
+def debug_test_youtube_simple():
+    """YouTube API Test - nur ein einfacher Call"""
+    try:
+        if not YOUTUBE_API_KEY:
+            return jsonify({'error': 'No YouTube API key'}), 500
+            
+        # Einfachster YouTube API Call
+        url = 'https://www.googleapis.com/youtube/v3/channels'
+        params = {
+            'key': YOUTUBE_API_KEY,
+            'id': 'UCN9Tn5k8KrW8rMwb-3HDGkg',  # CryptoHeroesYT
+            'part': 'snippet'
+        }
+        
+        print("Testing YouTube API...")
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('items'):
+                channel_title = data['items'][0]['snippet']['title']
+                return jsonify({
+                    'status': 'ok',
+                    'youtube_api': 'working',
+                    'channel_title': channel_title,
+                    'quota_used': 'minimal'
+                })
+            else:
+                return jsonify({'error': 'Channel not found'}), 404
+        else:
+            return jsonify({
+                'error': f'YouTube API error: {response.status_code}',
+                'response': response.text[:200]
+            }), 500
+            
+    except Exception as e:
+        print(f"YOUTUBE API ERROR: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# MAIN ENDPOINTS
 @app.route('/health')
 def health():
     """Health Check"""
@@ -285,11 +383,14 @@ def health():
 def monitor_videos():
     """YouTube Videos überwachen (8-22 Uhr, alle 2h)"""
     try:
+        print("Starting video monitoring...")
+        
         # Zeitcheck: Nur zwischen 8-22 Uhr ausführen (UTC berücksichtigen)
         current_hour = datetime.utcnow().hour
         # Deutschland: UTC+1 (Winter) oder UTC+2 (Sommer)
         # Vereinfacht: Prüfe UTC 7-21 Uhr (entspricht 8-22 oder 9-23 deutsche Zeit)
         if current_hour < 7 or current_hour > 21:
+            print(f"Outside monitoring hours. Current UTC hour: {current_hour}")
             return jsonify({
                 'message': 'Außerhalb der Monitoring-Zeiten (8-22 Uhr)',
                 'current_utc_hour': current_hour
@@ -309,6 +410,7 @@ def monitor_videos():
                 with sqlite3.connect('youtube_monitor.db') as conn:
                     cursor = conn.execute('SELECT id FROM videos WHERE video_id = ?', (video_id,))
                     if cursor.fetchone():
+                        print(f"Video already processed: {title}")
                         continue  # Video bereits verarbeitet
                 
                 print(f"Processing new video: {title}")
@@ -341,6 +443,8 @@ def monitor_videos():
                     f"**{title}**\n\n{summary[:300]}..."
                 )
         
+        print(f"Monitoring completed. Processed {len(new_videos)} new videos.")
+        
         return jsonify({
             'success': True,
             'new_videos': len(new_videos),
@@ -357,6 +461,7 @@ def monitor_videos():
 def create_daily_summary():
     """Tägliche Zusammenfassung erstellen (21:00 Uhr)"""
     try:
+        print("Creating daily summary...")
         today = datetime.now().date().isoformat()
         
         # Heutige Videos abrufen
@@ -371,6 +476,7 @@ def create_daily_summary():
             daily_videos = cursor.fetchall()
         
         if not daily_videos:
+            print("No videos processed today")
             return jsonify({'message': 'Keine Videos heute verarbeitet'})
         
         # Content für Zusammenfassung vorbereiten
@@ -394,6 +500,8 @@ def create_daily_summary():
             daily_summary
         )
         
+        print(f"Daily summary created for {len(daily_videos)} videos")
+        
         return jsonify({
             'success': True,
             'videos_count': len(daily_videos),
@@ -401,6 +509,7 @@ def create_daily_summary():
         })
         
     except Exception as e:
+        print(f"Error in daily_summary: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/videos')
@@ -427,8 +536,13 @@ def get_videos():
                 for row in cursor.fetchall()
             ]
         
-        return jsonify(videos)
+        return jsonify({
+            'success': True,
+            'count': len(videos),
+            'videos': videos
+        })
     except Exception as e:
+        print(f"Error in get_videos: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/test_channel/<channel_key>')
@@ -439,9 +553,11 @@ def test_channel(channel_key):
     
     try:
         youtube_data = YOUTUBERS[channel_key]
+        print(f"Testing channel: {youtube_data['name']}")
         videos = get_channel_videos(youtube_data['channel_id'], hours_back=168)  # 1 Woche
         
         return jsonify({
+            'success': True,
             'channel': youtube_data['name'],
             'channel_id': youtube_data['channel_id'],
             'videos_found': len(videos),
@@ -455,9 +571,12 @@ def test_channel(channel_key):
             ]
         })
     except Exception as e:
+        print(f"Error testing channel {channel_key}: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
+    print("Initializing YouTube Monitor...")
     init_db()
     port = int(os.environ.get('PORT', 5000))
+    print(f"Starting Flask app on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
