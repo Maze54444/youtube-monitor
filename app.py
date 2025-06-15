@@ -1,755 +1,475 @@
-from flask import Flask, request, jsonify
 import os
-import requests
 import json
-from datetime import datetime, timedelta
-from youtube_transcript_api import YouTubeTranscriptApi
+import csv
 import sqlite3
-from threading import Lock
-import base64
-import io
-
-# Google Drive API
+import schedule
+import time
+import requests
+from datetime import datetime, timedelta
+from flask import Flask, jsonify
 from googleapiclient.discovery import build
-from google.oauth2 import service_account
-from googleapiclient.http import MediaIoBaseUpload
+from google.oauth2.service_account import Credentials
+from googleapiclient.http import MediaFileUpload
+import google.generativeai as genai
+import telegram
+from telegram import Bot
+from youtube_transcript_api import YouTubeTranscriptApi
+import logging
 
+# Logging Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Flask App
 app = Flask(__name__)
-db_lock = Lock()
 
-# Konfiguration aus Environment Variables
-YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-GOOGLE_DRIVE_CREDENTIALS = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')  # NEU: Google Drive Service Account JSON (base64 encoded)
+# Environment Variables
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+GOOGLE_SERVICE_ACCOUNT_KEY = os.getenv('GOOGLE_SERVICE_ACCOUNT_KEY')
+GOOGLE_DRIVE_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-# Google Drive Service
-drive_service = None
-
-# ECHTE deutsche Finanz/Krypto YouTuber Channel IDs
-YOUTUBERS = {
-    'finanzfluss': {
-        'channel_id': 'UCeARcCKcT_yI5l1HOHocTrw',  # Finanzfluss - 1M+ Subs
-        'name': 'Finanzfluss'
+# YouTube Kanäle zum Überwachen (Demo-Kanäle für ersten Test)
+CHANNELS_TO_MONITOR = [
+    {
+        'name': 'MrBeast',
+        'channel_id': 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+        'keywords': ['challenge', 'money', 'give']
     },
-    'talerbox': {
-        'channel_id': 'UCNWuGqqHFmMy-KyASkH8QLg',  # Talerbox - 800K+ Subs
-        'name': 'Talerbox'
-    },
-    'investmentpunk': {
-        'channel_id': 'UC-muQ8tDvOls3zoMBo_41fA',  # Investment Punk - 500K+ Subs
-        'name': 'Investment Punk'
-    },
-    'aktienmitsteve': {
-        'channel_id': 'UCgPjewCPNX74Rq7MDxPXHHg',  # Aktien mit Steve - 400K+ Subs
-        'name': 'Aktien mit Steve'
-    },
-    'cryptoheroes': {
-        'channel_id': 'UC_PLACEHOLDER_HIER_DEINE_ECHTE_ID',  # CryptoHeroes - Du musst die echte ID finden!
-        'name': 'CryptoHeroes'
+    {
+        'name': 'Veritasium',
+        'channel_id': 'UCHnyfMqiRRG1u-2MsSQLbXA',
+        'keywords': ['science', 'physics', 'experiment']
     }
-}
+]
 
-# Google Drive Ordner IDs (werden bei Setup erstellt)
-DRIVE_FOLDER_IDS = {
-    'main': None,           # "transkripte"
-    'raw': None,            # "rohtranskripte" 
-    'single': None,         # "einzelne zusammenfassung"
-    'daily': None           # "Tages zusammenfassung"
-}
+# Globale Services
+youtube_service = None
+drive_service = None
+telegram_bot = None
 
-# Prompts für Gemini API
-INDIVIDUAL_VIDEO_PROMPT = """
-Du bist ein Experte für YouTube-Video-Zusammenfassungen im Finanz- und Krypto-Bereich.
-
-Erstelle eine strukturierte deutsche Zusammenfassung dieses YouTube-Video-Transkripts:
-
-**STRUKTUR:**
-1. **Hauptthema** - Worum geht es in einem Satz?
-2. **Kernaussagen** - Die 3-5 wichtigsten Punkte als Stichpunkte
-3. **Details & Insights** - Interessante Fakten, Zahlen oder Erkenntnisse
-4. **Fazit** - Was ist die wichtigste Erkenntnis oder der Aufruf zum Handeln?
-
-**RICHTLINIEN:**
-- Fokus auf Fakten und konkrete Inhalte
-- Ignoriere Füllwörter und Wiederholungen
-- Hervorhebung von Preiszielen, Empfehlungen oder Warnungen
-- Erwähne wichtige Daten oder Deadlines
-
-**TRANSKRIPTION:**
-{transcript}
-"""
-
-DAILY_SUMMARY_PROMPT = """
-Erstelle eine Executive Summary aller heute verarbeiteten Finanz/Krypto-YouTube-Videos:
-
-**STRUKTUR:**
-1. **Überblick** - Anzahl Videos und Kanäle
-2. **Hauptthemen** - Wiederkehrende oder wichtige Themen des Tages
-3. **Top Insights** - Die wertvollsten Informationen und Empfehlungen
-4. **Markt-Trends** - Was fällt bei Preisen, Projekten oder Entwicklungen auf?
-5. **Action Items** - Konkrete Handlungsempfehlungen aus den Videos
-
-**VIDEOS DES TAGES:**
-{daily_content}
-"""
-
-def init_google_drive():
-    """Google Drive Service initialisieren"""
-    global drive_service
+def initialize_services():
+    """Initialisiere alle externen Services"""
+    global youtube_service, drive_service, telegram_bot
     
     try:
-        if not GOOGLE_DRIVE_CREDENTIALS:
-            print("❌ Google Drive credentials not configured")
-            return False
+        # YouTube API
+        if YOUTUBE_API_KEY:
+            youtube_service = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+            logger.info("✅ YouTube API initialisiert")
         
-        # Base64 dekodieren
-        credentials_json = base64.b64decode(GOOGLE_DRIVE_CREDENTIALS).decode('utf-8')
-        credentials_dict = json.loads(credentials_json)
+        # Google Drive API
+        if GOOGLE_SERVICE_ACCOUNT_KEY:
+            import base64
+            service_account_info = json.loads(base64.b64decode(GOOGLE_SERVICE_ACCOUNT_KEY))
+            credentials = Credentials.from_service_account_info(service_account_info)
+            drive_service = build('drive', 'v3', credentials=credentials)
+            logger.info("✅ Google Drive API initialisiert")
         
-        # Service Account Credentials erstellen
-        credentials = service_account.Credentials.from_service_account_info(
-            credentials_dict,
-            scopes=['https://www.googleapis.com/auth/drive.file']
+        # Telegram Bot
+        if TELEGRAM_BOT_TOKEN:
+            telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+            logger.info("✅ Telegram Bot initialisiert")
+        
+        # Gemini AI
+        if GEMINI_API_KEY:
+            genai.configure(api_key=GEMINI_API_KEY)
+            logger.info("✅ Gemini AI initialisiert")
+            
+    except Exception as e:
+        logger.error(f"❌ Fehler beim Initialisieren der Services: {e}")
+
+def setup_database():
+    """SQLite Datenbank für Video-Tracking"""
+    conn = sqlite3.connect('youtube_monitor.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT UNIQUE,
+            channel_name TEXT,
+            title TEXT,
+            published_at TEXT,
+            description TEXT,
+            view_count INTEGER,
+            like_count INTEGER,
+            transcript TEXT,
+            summary TEXT,
+            checked_at TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    logger.info("✅ Datenbank initialisiert")
+
+def get_channel_videos(channel_id, max_results=10):
+    """Hole neueste Videos von einem YouTube-Kanal"""
+    try:
+        request = youtube_service.search().list(
+            part='snippet',
+            channelId=channel_id,
+            maxResults=max_results,
+            order='date',
+            type='video',
+            publishedAfter=(datetime.now() - timedelta(days=7)).isoformat() + 'Z'
         )
         
-        # Drive Service erstellen
-        drive_service = build('drive', 'v3', credentials=credentials)
-        
-        print("✅ Google Drive service initialized")
-        
-        # Ordnerstruktur erstellen
-        setup_drive_folders()
-        
-        return True
+        response = request.execute()
+        return response.get('items', [])
         
     except Exception as e:
-        print(f"❌ Google Drive initialization error: {e}")
-        return False
+        logger.error(f"❌ Fehler beim Abrufen der Videos: {e}")
+        return []
 
-def setup_drive_folders():
-    """Google Drive Ordnerstruktur erstellen"""
-    global DRIVE_FOLDER_IDS
-    
+def get_video_details(video_id):
+    """Hole detaillierte Informationen zu einem Video"""
     try:
-        # 1. Hauptordner "transkripte" erstellen/finden
-        main_folder_id = find_or_create_folder("transkripte", None)
-        DRIVE_FOLDER_IDS['main'] = main_folder_id
+        request = youtube_service.videos().list(
+            part='statistics,snippet',
+            id=video_id
+        )
         
-        # 2. Unterordner erstellen
-        DRIVE_FOLDER_IDS['raw'] = find_or_create_folder("rohtranskripte", main_folder_id)
-        DRIVE_FOLDER_IDS['single'] = find_or_create_folder("einzelne zusammenfassung", main_folder_id)
-        DRIVE_FOLDER_IDS['daily'] = find_or_create_folder("Tages zusammenfassung", main_folder_id)
-        
-        print("✅ Google Drive folder structure created:")
-        print(f"   📁 transkripte/ ({main_folder_id})")
-        print(f"   ├── 📁 rohtranskripte/ ({DRIVE_FOLDER_IDS['raw']})")
-        print(f"   ├── 📁 einzelne zusammenfassung/ ({DRIVE_FOLDER_IDS['single']})")
-        print(f"   └── 📁 Tages zusammenfassung/ ({DRIVE_FOLDER_IDS['daily']})")
+        response = request.execute()
+        if response['items']:
+            return response['items'][0]
+        return None
         
     except Exception as e:
-        print(f"❌ Error setting up Drive folders: {e}")
-
-def find_or_create_folder(folder_name, parent_id=None):
-    """Google Drive Ordner finden oder erstellen"""
-    try:
-        # Suche nach existierendem Ordner
-        query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
-        if parent_id:
-            query += f" and '{parent_id}' in parents"
-        
-        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-        files = results.get('files', [])
-        
-        if files:
-            # Ordner existiert bereits
-            folder_id = files[0]['id']
-            print(f"📁 Found existing folder: {folder_name} ({folder_id})")
-            return folder_id
-        else:
-            # Ordner erstellen
-            folder_metadata = {
-                'name': folder_name,
-                'mimeType': 'application/vnd.google-apps.folder'
-            }
-            
-            if parent_id:
-                folder_metadata['parents'] = [parent_id]
-            
-            folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
-            folder_id = folder.get('id')
-            
-            print(f"✅ Created folder: {folder_name} ({folder_id})")
-            return folder_id
-            
-    except Exception as e:
-        print(f"❌ Error with folder {folder_name}: {e}")
+        logger.error(f"❌ Fehler beim Abrufen der Video-Details: {e}")
         return None
 
-def upload_to_drive(content, filename, folder_id, mime_type='text/plain'):
-    """Datei zu Google Drive hochladen"""
+def get_video_transcript(video_id):
+    """Hole Transkript eines Videos"""
     try:
-        if not drive_service or not folder_id:
-            print("❌ Drive service or folder not available")
+        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['de', 'en'])
+        text = ' '.join([entry['text'] for entry in transcript])
+        return text
+    except Exception as e:
+        logger.warning(f"⚠️ Kein Transkript verfügbar für Video {video_id}: {e}")
+        return None
+
+def generate_summary(transcript):
+    """Generiere Zusammenfassung mit Gemini AI"""
+    try:
+        if not GEMINI_API_KEY:
+            return "Gemini AI nicht konfiguriert"
+            
+        model = genai.GenerativeModel('gemini-pro')
+        prompt = f"""
+        Erstelle eine kurze Zusammenfassung (max. 100 Wörter) des folgenden YouTube-Video-Transkripts:
+        
+        {transcript[:3000]}  # Beschränke auf erste 3000 Zeichen
+        
+        Fokussiere dich auf die wichtigsten Punkte und Erkenntnisse.
+        """
+        
+        response = model.generate_content(prompt)
+        return response.text
+        
+    except Exception as e:
+        logger.error(f"❌ Fehler bei Gemini AI Zusammenfassung: {e}")
+        return "Fehler bei der Zusammenfassung"
+
+def save_to_database(video_data):
+    """Speichere Video-Daten in Datenbank"""
+    conn = sqlite3.connect('youtube_monitor.db')
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            INSERT OR REPLACE INTO videos 
+            (video_id, channel_name, title, published_at, description, view_count, like_count, transcript, summary, checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', video_data)
+        
+        conn.commit()
+        logger.info(f"✅ Video gespeichert: {video_data[2]}")
+        
+    except Exception as e:
+        logger.error(f"❌ Fehler beim Speichern in Datenbank: {e}")
+    finally:
+        conn.close()
+
+def create_csv_report():
+    """Erstelle CSV-Report aller Videos"""
+    conn = sqlite3.connect('youtube_monitor.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM videos ORDER BY published_at DESC')
+    videos = cursor.fetchall()
+    
+    filename = f'youtube_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['ID', 'Video ID', 'Kanal', 'Titel', 'Veröffentlicht', 'Beschreibung', 
+                        'Views', 'Likes', 'Transkript', 'Zusammenfassung', 'Überprüft'])
+        writer.writerows(videos)
+    
+    conn.close()
+    return filename
+
+def upload_to_drive(filename):
+    """Lade Datei zu Google Drive hoch"""
+    try:
+        if not drive_service:
+            logger.error("❌ Google Drive Service nicht verfügbar")
             return None
-        
-        # Content als BytesIO Stream
-        file_stream = io.BytesIO(content.encode('utf-8'))
-        
-        # File Metadata
+            
         file_metadata = {
             'name': filename,
-            'parents': [folder_id]
+            'parents': [GOOGLE_DRIVE_FOLDER_ID]
         }
         
-        # Media Upload
-        media = MediaIoBaseUpload(file_stream, mimetype=mime_type, resumable=True)
-        
-        # Upload
+        media = MediaFileUpload(filename, resumable=True)
         file = drive_service.files().create(
             body=file_metadata,
             media_body=media,
             fields='id'
         ).execute()
         
-        file_id = file.get('id')
-        print(f"✅ Uploaded to Drive: {filename} ({file_id})")
-        
-        return file_id
+        logger.info(f"✅ Datei zu Google Drive hochgeladen: {filename}")
+        return file.get('id')
         
     except Exception as e:
-        print(f"❌ Error uploading {filename}: {e}")
+        logger.error(f"❌ Fehler beim Upload zu Google Drive: {e}")
         return None
 
-def clean_filename(title):
-    """YouTube Titel für Dateiname bereinigen"""
-    # Ungültige Zeichen entfernen
-    invalid_chars = '<>:"/\\|?*'
-    for char in invalid_chars:
-        title = title.replace(char, '')
-    
-    # Zu lange Titel kürzen
-    if len(title) > 100:
-        title = title[:100]
-    
-    return title.strip()
-
-def init_db():
-    """Datenbank initialisieren"""
+def send_telegram_notification(message):
+    """Sende Telegram-Benachrichtigung"""
     try:
-        with sqlite3.connect('youtube_monitor.db') as conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS videos (
-                    id INTEGER PRIMARY KEY,
-                    video_id TEXT UNIQUE,
-                    channel_name TEXT,
-                    title TEXT,
-                    published_at TEXT,
-                    processed_at TEXT,
-                    transcript TEXT,
-                    summary TEXT,
-                    drive_raw_file_id TEXT,
-                    drive_summary_file_id TEXT
-                )
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS daily_summaries (
-                    id INTEGER PRIMARY KEY,
-                    date TEXT UNIQUE,
-                    summary TEXT,
-                    created_at TEXT,
-                    drive_file_id TEXT
-                )
-            ''')
-        
-        print("✅ Database initialized successfully")
-        
-    except Exception as e:
-        print(f"❌ Database initialization error: {e}")
-
-def get_channel_videos(channel_id, hours_back=2):
-    """Neue Videos eines Kanals abrufen"""
-    try:
-        published_after = (datetime.utcnow() - timedelta(hours=hours_back)).isoformat() + 'Z'
-        
-        url = 'https://www.googleapis.com/youtube/v3/search'
-        params = {
-            'key': YOUTUBE_API_KEY,
-            'channelId': channel_id,
-            'part': 'snippet',
-            'order': 'date',
-            'maxResults': 5,
-            'publishedAfter': published_after,
-            'type': 'video'
-        }
-        
-        print(f"Fetching videos for channel {channel_id} since {published_after}")
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        
-        data = response.json()
-        print(f"Found {len(data.get('items', []))} videos")
-        return data.get('items', [])
-        
-    except Exception as e:
-        print(f"Error fetching videos for channel {channel_id}: {e}")
-        return []
-
-def get_transcript(video_id):
-    """Transkript abrufen - API Version 0.6.2"""
-    try:
-        print(f"Getting transcript for video {video_id}")
-        
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        try:
-            transcript = transcript_list.find_transcript(['de'])
-        except:
-            try:
-                transcript = transcript_list.find_transcript(['en'])
-            except:
-                transcript = transcript_list.find_generated_transcript(['de', 'en'])
-        
-        transcript_data = transcript.fetch()
-        full_text = ' '.join([entry['text'] for entry in transcript_data])
-        
-        print(f"✅ Transcript fetched successfully, length: {len(full_text)} chars")
-        return {
-            'success': True,
-            'transcript': full_text,
-            'language': transcript.language_code
-        }
-    except Exception as e:
-        print(f"❌ Transcript error for {video_id}: {e}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
-
-def call_gemini_api(prompt, model="gemini-1.5-flash"):
-    """Gemini API für Zusammenfassungen"""
-    try:
-        print(f"Calling Gemini API with prompt length: {len(prompt)}")
-        headers = {'Content-Type': 'application/json'}
-        
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}'
-        
-        data = {
-            'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {
-                'maxOutputTokens': 4000,
-                'temperature': 0.7
-            }
-        }
-        
-        response = requests.post(url, headers=headers, json=data, timeout=60)
-        response.raise_for_status()
-        
-        result = response.json()
-        summary = result['candidates'][0]['content']['parts'][0]['text']
-        print(f"✅ Gemini API response received, length: {len(summary)}")
-        return summary
-        
-    except Exception as e:
-        print(f"❌ Gemini API Error: {e}")
-        return f"Fehler bei der Zusammenfassung: {e}"
-
-def smart_chunk_processing(transcript):
-    """Intelligente Chunk-Verarbeitung"""
-    max_chunk_size = 30000
-    
-    if len(transcript) <= max_chunk_size:
-        return call_gemini_api(INDIVIDUAL_VIDEO_PROMPT.format(transcript=transcript))
-    
-    print(f"Large transcript ({len(transcript)} chars), chunking...")
-    
-    sentences = transcript.split('. ')
-    chunks = []
-    current_chunk = ""
-    
-    for sentence in sentences:
-        if len(current_chunk + sentence) > max_chunk_size:
-            if current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = sentence
-            else:
-                chunks.append(sentence)
-        else:
-            current_chunk += sentence + ". "
-    
-    if current_chunk:
-        chunks.append(current_chunk)
-    
-    print(f"Split into {len(chunks)} chunks")
-    
-    chunk_summaries = []
-    for i, chunk in enumerate(chunks):
-        chunk_prompt = f"""
-Fasse diesen Teil einer YouTube-Transkription zusammen (Teil {i+1} von {len(chunks)}):
-
-{chunk}
-
-Fokus auf:
-- Hauptpunkte und Kernaussagen
-- Wichtige Details und Fakten
-- Zusammenhänge und Schlussfolgerungen
-"""
-        summary = call_gemini_api(chunk_prompt)
-        chunk_summaries.append(summary)
-    
-    final_prompt = INDIVIDUAL_VIDEO_PROMPT.format(
-        transcript='\n'.join([f"Teil {i+1}: {summary}" for i, summary in enumerate(chunk_summaries)])
-    )
-    
-    return call_gemini_api(final_prompt)
-
-def save_video_to_db_and_drive(video_data):
-    """Video in DB UND Google Drive speichern"""
-    with db_lock:
-        try:
-            # Dateinamen erstellen
-            clean_title = clean_filename(video_data['title'])
-            today = datetime.now().strftime('%Y-%m-%d')
+        if not telegram_bot or not TELEGRAM_CHAT_ID:
+            logger.error("❌ Telegram Bot nicht konfiguriert")
+            return False
             
-            raw_filename = f"{clean_title}.txt"
-            summary_filename = f"{clean_title}_{today}.txt"
-            
-            # Zu Google Drive hochladen
-            raw_file_id = upload_to_drive(
-                video_data['transcript'], 
-                raw_filename, 
-                DRIVE_FOLDER_IDS['raw']
-            )
-            
-            summary_file_id = upload_to_drive(
-                video_data['summary'], 
-                summary_filename, 
-                DRIVE_FOLDER_IDS['single']
-            )
-            
-            # In Datenbank speichern
-            with sqlite3.connect('youtube_monitor.db') as conn:
-                conn.execute('''
-                    INSERT OR REPLACE INTO videos 
-                    (video_id, channel_name, title, published_at, processed_at, transcript, summary, drive_raw_file_id, drive_summary_file_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    video_data['video_id'],
-                    video_data['channel_name'],
-                    video_data['title'],
-                    video_data['published_at'],
-                    datetime.now().isoformat(),
-                    video_data['transcript'],
-                    video_data['summary'],
-                    raw_file_id,
-                    summary_file_id
-                ))
-                
-            print(f"✅ Video saved to DB and Drive: {video_data['title']}")
-            
-        except Exception as e:
-            print(f"❌ Error saving video: {e}")
-
-def send_telegram_message(message):
-    """Telegram Benachrichtigung senden"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Telegram not configured")
-        return False
-    
-    try:
-        url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
-        data = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'Markdown'
-        }
-        
-        response = requests.post(url, json=data, timeout=10)
-        response.raise_for_status()
-        
-        print("✅ Telegram notification sent")
-        return True
-    except Exception as e:
-        print(f"❌ Telegram error: {e}")
-        return False
-
-# DEBUG ENDPOINTS
-@app.route('/debug/test_drive')
-def debug_test_drive():
-    """Google Drive Test"""
-    try:
-        if not drive_service:
-            return jsonify({'error': 'Google Drive not initialized', 'configured': bool(GOOGLE_DRIVE_CREDENTIALS)})
-        
-        # Test Upload
-        test_content = f"Test Upload - {datetime.now().isoformat()}"
-        test_filename = f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        
-        file_id = upload_to_drive(test_content, test_filename, DRIVE_FOLDER_IDS['raw'])
-        
-        return jsonify({
-            'status': 'ok',
-            'drive_service': 'working',
-            'folders': DRIVE_FOLDER_IDS,
-            'test_upload': file_id is not None,
-            'test_file_id': file_id
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/health')
-def health():
-    """Health Check"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'monitored_channels': len(YOUTUBERS),
-        'api_keys_configured': {
-            'youtube': bool(YOUTUBE_API_KEY),
-            'gemini': bool(GEMINI_API_KEY),
-            'telegram': bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
-            'google_drive': bool(GOOGLE_DRIVE_CREDENTIALS)
-        },
-        'storage': {
-            'database': 'youtube_monitor.db',
-            'google_drive': 'transkripte/ folder structure',
-            'folders': DRIVE_FOLDER_IDS
-        }
-    })
-
-@app.route('/monitor', methods=['POST'])
-def monitor_videos():
-    """YouTube Videos überwachen"""
-    try:
-        print("🔍 Starting video monitoring...")
-        
-        current_hour = datetime.utcnow().hour
-        if current_hour < 7 or current_hour > 21:
-            return jsonify({
-                'message': 'Außerhalb der Monitoring-Zeiten (8-22 Uhr)',
-                'current_utc_hour': current_hour
-            })
-        
-        new_videos = []
-        
-        for youtube_key, youtube_data in YOUTUBERS.items():
-            print(f"🔍 Checking channel: {youtube_data['name']}")
-            videos = get_channel_videos(youtube_data['channel_id'])
-            
-            for video in videos:
-                video_id = video['id']['videoId']
-                title = video['snippet']['title']
-                
-                # Bereits verarbeitet?
-                with sqlite3.connect('youtube_monitor.db') as conn:
-                    cursor = conn.execute('SELECT id FROM videos WHERE video_id = ?', (video_id,))
-                    if cursor.fetchone():
-                        print(f"⏭️ Video already processed: {title}")
-                        continue
-                
-                print(f"🎬 Processing new video: {title}")
-                
-                # Transkript abrufen
-                transcript_result = get_transcript(video_id)
-                if not transcript_result['success']:
-                    print(f"❌ Could not get transcript: {transcript_result['error']}")
-                    continue
-                
-                # Zusammenfassung erstellen
-                summary = smart_chunk_processing(transcript_result['transcript'])
-                
-                # Video Daten
-                video_data = {
-                    'video_id': video_id,
-                    'channel_name': youtube_data['name'],
-                    'title': title,
-                    'published_at': video['snippet']['publishedAt'],
-                    'transcript': transcript_result['transcript'],
-                    'summary': summary
-                }
-                
-                # In DB und Drive speichern
-                save_video_to_db_and_drive(video_data)
-                new_videos.append(video_data)
-                
-                # Telegram Benachrichtigung
-                telegram_message = f"""
-🎬 **Neues Video verarbeitet!**
-
-📺 **Channel:** {youtube_data['name']}
-🎯 **Titel:** {title}
-🕒 **Zeit:** {datetime.now().strftime('%H:%M')}
-📁 **Google Drive:** ✅ Gespeichert
-
-📝 **Zusammenfassung:**
-{summary[:400]}{'...' if len(summary) > 400 else ''}
-
-🔗 **Video:** https://youtube.com/watch?v={video_id}
-                """
-                
-                send_telegram_message(telegram_message)
-        
-        print(f"✅ Monitoring completed. Processed {len(new_videos)} new videos.")
-        
-        return jsonify({
-            'success': True,
-            'new_videos': len(new_videos),
-            'processed_videos': [{'channel': v['channel_name'], 'title': v['title']} for v in new_videos],
-            'google_drive_uploads': len(new_videos) * 2,  # Raw + Summary
-            'telegram_sent': len(new_videos) > 0
-        })
-        
-    except Exception as e:
-        print(f"❌ Error in monitor_videos: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/daily_summary', methods=['POST'])
-def create_daily_summary():
-    """Tägliche Zusammenfassung erstellen"""
-    try:
-        print("📊 Creating daily summary...")
-        today = datetime.now().date().isoformat()
-        
-        # Heutige Videos abrufen
-        with sqlite3.connect('youtube_monitor.db') as conn:
-            cursor = conn.execute('''
-                SELECT channel_name, title, summary 
-                FROM videos 
-                WHERE date(processed_at) = ? 
-                ORDER BY processed_at
-            ''', (today,))
-            
-            daily_videos = cursor.fetchall()
-        
-        if not daily_videos:
-            return jsonify({'message': 'Keine Videos heute verarbeitet'})
-        
-        # Zusammenfassung erstellen
-        daily_content = ""
-        for channel, title, summary in daily_videos:
-            daily_content += f"\n**{channel} - {title}**\n{summary}\n\n"
-        
-        daily_summary = call_gemini_api(DAILY_SUMMARY_PROMPT.format(daily_content=daily_content))
-        
-        # Dateiname für Drive
-        summary_filename = f"Tages_Zusammenfassung_{today}.txt"
-        
-        # Zu Google Drive hochladen
-        drive_file_id = upload_to_drive(
-            daily_summary, 
-            summary_filename, 
-            DRIVE_FOLDER_IDS['daily']
+        telegram_bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=message,
+            parse_mode='HTML'
         )
         
-        # In Datenbank speichern
-        with sqlite3.connect('youtube_monitor.db') as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO daily_summaries (date, summary, created_at, drive_file_id)
-                VALUES (?, ?, ?, ?)
-            ''', (today, daily_summary, datetime.now().isoformat(), drive_file_id))
-        
-        # Telegram Benachrichtigung
-        telegram_message = f"""
-📊 **Tageszusammenfassung - {today}**
-🎬 **Videos verarbeitet:** {len(daily_videos)}
-📁 **Google Drive:** ✅ Gespeichert
-
-{daily_summary[:800]}{'...' if len(daily_summary) > 800 else ''}
-
----
-🤖 YouTube Monitor Bot
-        """
-        
-        send_telegram_message(telegram_message)
-        
-        print(f"✅ Daily summary created for {len(daily_videos)} videos")
-        
-        return jsonify({
-            'success': True,
-            'videos_count': len(daily_videos),
-            'summary': daily_summary[:500] + '...',
-            'drive_file_id': drive_file_id,
-            'telegram_sent': True
-        })
+        logger.info("✅ Telegram-Nachricht gesendet")
+        return True
         
     except Exception as e:
-        print(f"❌ Error in daily_summary: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.error(f"❌ Fehler beim Senden der Telegram-Nachricht: {e}")
+        return False
 
-@app.route('/videos')
-def get_videos():
-    """Alle verarbeiteten Videos anzeigen"""
-    try:
-        with sqlite3.connect('youtube_monitor.db') as conn:
-            cursor = conn.execute('''
-                SELECT video_id, channel_name, title, processed_at, summary, drive_raw_file_id, drive_summary_file_id
-                FROM videos 
-                ORDER BY processed_at DESC 
-                LIMIT 50
-            ''')
+def check_channels():
+    """Hauptfunktion: Überprüfe alle Kanäle"""
+    logger.info("🔍 Starte Kanal-Überprüfung...")
+    
+    new_videos_count = 0
+    all_new_videos = []
+    
+    for channel in CHANNELS_TO_MONITOR:
+        logger.info(f"📺 Überprüfe Kanal: {channel['name']}")
+        
+        videos = get_channel_videos(channel['channel_id'])
+        
+        for video in videos:
+            video_id = video['id']['videoId']
             
-            videos = [
-                {
-                    'video_id': row[0],
-                    'channel_name': row[1],
-                    'title': row[2],
-                    'processed_at': row[3],
-                    'summary': row[4][:200] + '...' if len(row[4]) > 200 else row[4],
-                    'youtube_url': f'https://www.youtube.com/watch?v={row[0]}',
-                    'drive_raw_file': row[5],
-                    'drive_summary_file': row[6]
-                }
-                for row in cursor.fetchall()
-            ]
-        
-        return jsonify({
-            'success': True,
-            'count': len(videos),
-            'videos': videos,
-            'storage': 'Database + Google Drive'
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/test_channel/<channel_key>')
-def test_channel(channel_key):
-    """Einzelnen Kanal testen"""
-    if channel_key not in YOUTUBERS:
-        return jsonify({'error': f'Channel {channel_key} not found'}), 404
+            # Prüfe ob Video bereits in Datenbank
+            conn = sqlite3.connect('youtube_monitor.db')
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM videos WHERE video_id = ?', (video_id,))
+            exists = cursor.fetchone()
+            conn.close()
+            
+            if not exists:
+                # Neues Video gefunden
+                details = get_video_details(video_id)
+                if details:
+                    transcript = get_video_transcript(video_id)
+                    summary = generate_summary(transcript) if transcript else "Kein Transkript verfügbar"
+                    
+                    video_data = (
+                        video_id,
+                        channel['name'],
+                        details['snippet']['title'],
+                        details['snippet']['publishedAt'],
+                        details['snippet']['description'][:500],  # Beschränke Beschreibung
+                        int(details['statistics'].get('viewCount', 0)),
+                        int(details['statistics'].get('likeCount', 0)),
+                        transcript,
+                        summary,
+                        datetime.now().isoformat()
+                    )
+                    
+                    save_to_database(video_data)
+                    all_new_videos.append({
+                        'title': details['snippet']['title'],
+                        'url': f"https://youtube.com/watch?v={video_id}",
+                        'channel': channel['name'],
+                        'published': details['snippet']['publishedAt']
+                    })
+                    new_videos_count += 1
     
+    # Sende Benachrichtigung wenn neue Videos gefunden
+    if new_videos_count > 0:
+        message = f"🎬 <b>YouTube Monitor Update</b>\n\n"
+        message += f"📊 Neue Videos gefunden: {new_videos_count}\n\n"
+        
+        for video in all_new_videos[:5]:  # Zeige max. 5 Videos
+            message += f"📹 <b>{video['title'][:50]}...</b>\n"
+            message += f"📺 Kanal: {video['channel']}\n"
+            message += f"🔗 {video['url']}\n\n"
+        
+        # CSV-Report erstellen und hochladen
+        csv_filename = create_csv_report()
+        drive_file_id = upload_to_drive(csv_filename)
+        
+        if drive_file_id:
+            message += "💾 CSV-Report in Google Drive hochgeladen"
+        
+        send_telegram_notification(message)
+        
+        # Lokale CSV-Datei löschen
+        if os.path.exists(csv_filename):
+            os.remove(csv_filename)
+    
+    logger.info(f"✅ Überprüfung abgeschlossen. {new_videos_count} neue Videos gefunden.")
+
+# Flask-Routen für Render
+@app.route('/')
+def home():
+    """Haupt-Endpoint"""
+    return jsonify({
+        "service": "YouTube Monitor",
+        "status": "running",
+        "timestamp": datetime.now().isoformat(),
+        "endpoints": ["/health", "/status", "/manual-check"],
+        "monitored_channels": len(CHANNELS_TO_MONITOR)
+    })
+
+@app.route('/health')
+def health_check():
+    """Health Check für Render"""
     try:
-        youtube_data = YOUTUBERS[channel_key]
-        videos = get_channel_videos(youtube_data['channel_id'], hours_back=168)
+        env_vars = {
+            "youtube": bool(YOUTUBE_API_KEY),
+            "google_drive": bool(GOOGLE_SERVICE_ACCOUNT_KEY),
+            "telegram": bool(TELEGRAM_BOT_TOKEN),
+            "gemini": bool(GEMINI_API_KEY)
+        }
         
         return jsonify({
-            'success': True,
-            'channel': youtube_data['name'],
-            'channel_id': youtube_data['channel_id'],
-            'videos_found': len(videos),
-            'latest_videos': [
-                {
-                    'title': v['snippet']['title'],
-                    'published': v['snippet']['publishedAt'],
-                    'video_id': v['id']['videoId']
-                }
-                for v in videos[:5]
-            ]
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "api_keys_configured": env_vars,
+            "monitored_channels": len(CHANNELS_TO_MONITOR),
+            "database": "youtube_monitor.db"
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 
+@app.route('/status')
+def status():
+    """Detaillierter Status"""
+    try:
+        # Prüfe letzte Überprüfung aus Datenbank
+        conn = sqlite3.connect('youtube_monitor.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(checked_at) FROM videos')
+        last_check = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM videos')
+        total_videos = cursor.fetchone()[0]
+        conn.close()
+        
+        return jsonify({
+            "service": "YouTube Monitor",
+            "status": "running",
+            "environment": "production",
+            "platform": "render.com",
+            "timestamp": datetime.now().isoformat(),
+            "last_check": last_check or "Noch keine Überprüfung",
+            "total_videos_tracked": total_videos,
+            "next_check": "Automatisch alle 2 Stunden"
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error", 
+            "error": str(e)
+        }), 500
+
+@app.route('/manual-check')
+def manual_check():
+    """Manuelle Überprüfung starten"""
+    try:
+        check_channels()
+        return jsonify({
+            "status": "success",
+            "message": "Manuelle Überprüfung erfolgreich gestartet",
+            "timestamp": datetime.now().isoformat(),
+            "note": "Überprüfe Telegram für Updates"
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Fehler bei manueller Überprüfung: {str(e)}",
+            "timestamp": datetime.now().isoformat()
+        }), 500
+
+@app.route('/stats')
+def stats():
+    """Statistiken anzeigen"""
+    try:
+        conn = sqlite3.connect('youtube_monitor.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT channel_name, COUNT(*) FROM videos GROUP BY channel_name')
+        channel_stats = cursor.fetchall()
+        
+        cursor.execute('SELECT COUNT(*) FROM videos WHERE checked_at > ?', 
+                      [(datetime.now() - timedelta(days=1)).isoformat()])
+        videos_last_24h = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return jsonify({
+            "total_videos": sum([stat[1] for stat in channel_stats]),
+            "videos_last_24h": videos_last_24h,
+            "channel_stats": dict(channel_stats),
+            "monitored_channels": len(CHANNELS_TO_MONITOR)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+def start_scheduler():
+    """Starte den Scheduler für automatische Überprüfungen"""
+    schedule.every(2).hours.do(check_channels)
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(60)  # Überprüfe jede Minute
+
+# Hauptprogramm
 if __name__ == '__main__':
-    print("🚀 Initializing YouTube Monitor...")
-    init_db()
+    # Services initialisieren
+    initialize_services()
+    setup_database()
     
-    # Google Drive initialisieren
-    if init_google_drive():
-        print("✅ Google Drive ready")
-    else:
-        print("❌ Google Drive not available")
+    # Erste Überprüfung beim Start
+    logger.info("🚀 YouTube Monitor gestartet!")
     
+    # Teste ob alle Services funktionieren
+    try:
+        check_channels()
+    except Exception as e:
+        logger.error(f"❌ Fehler beim ersten Check: {e}")
+    
+    # Flask-Server starten
     port = int(os.environ.get('PORT', 5000))
-    print(f"🌐 Starting Flask app on port {port}")
+    
+    # In Produktion: nur Flask-Server, kein Scheduler
+    # (Render kann Cron-Jobs separat konfigurieren)
     app.run(host='0.0.0.0', port=port, debug=False)
